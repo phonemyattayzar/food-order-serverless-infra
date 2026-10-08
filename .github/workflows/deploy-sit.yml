@@ -1,0 +1,149 @@
+name: Deploy SIT release
+
+on:
+  repository_dispatch:
+    types: [deploy-release]
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: Unique release ID uploaded to the artifacts bucket
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: terraform-sit
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  TF_STATE_KEY: ${{ vars.TF_STATE_KEY }}
+  ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      release_version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release version
+        id: release
+        env:
+          DISPATCH_VERSION: ${{ github.event.client_payload.release_version }}
+          MANUAL_VERSION: ${{ inputs.release_version }}
+        run: |
+          version="${DISPATCH_VERSION:-$MANUAL_VERSION}"
+          if [[ -z "$version" || ! "$version" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "A valid release version is required." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download release bundle
+        run: |
+          mkdir -p build/release
+          aws s3 cp \
+            "s3://${ARTIFACT_BUCKET}/releases/${{ steps.release.outputs.version }}/deployment-bundle.tar.gz" \
+            build/deployment-bundle.tar.gz
+          tar -xzf build/deployment-bundle.tar.gz -C build/release
+          test -f build/release/lambda.zip
+          test -f build/release/frontend-dist/index.html
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+
+      - name: Terraform init and plan
+        run: |
+          test -n "$TF_STATE_BUCKET" || (echo "Set TF_STATE_BUCKET GitHub variable" >&2; exit 1)
+          test -n "$TF_STATE_KEY" || (echo "Set TF_STATE_KEY GitHub variable" >&2; exit 1)
+          terraform init \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=${TF_STATE_KEY}" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+          terraform fmt -check -recursive
+          terraform validate
+          terraform plan \
+            -var-file=sit.tfvars.example \
+            -var="lambda_package_path=build/release/lambda.zip" \
+            -var="static_site_path=build/release/frontend-dist" \
+            -out=build/sit.tfplan
+
+      - name: Save plan and release metadata
+        run: printf '%s\n' '${{ steps.release.outputs.version }}' > build/release-version.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sit-plan-${{ github.run_id }}
+          path: |
+            build/sit.tfplan
+            build/release-version.txt
+          retention-days: 1
+
+  apply:
+    needs: plan
+    runs-on: ubuntu-latest
+    environment: sit
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sit-plan-${{ github.run_id }}
+          path: build
+
+      - name: Download the planned release bundle
+        env:
+          RELEASE_VERSION: ${{ needs.plan.outputs.release_version }}
+        run: |
+          mkdir -p build/release
+          aws s3 cp \
+            "s3://${ARTIFACT_BUCKET}/releases/${RELEASE_VERSION}/deployment-bundle.tar.gz" \
+            build/deployment-bundle.tar.gz
+          tar -xzf build/deployment-bundle.tar.gz -C build/release
+
+      - name: Apply approved Terraform plan
+        run: |
+          terraform init \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=${TF_STATE_KEY}" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+          terraform apply build/sit.tfplan
+
+      - name: Run Alembic migrations
+        run: |
+          migration_function="$(terraform output -raw migration_lambda_name)"
+          aws lambda invoke \
+            --function-name "$migration_function" \
+            --cli-binary-format raw-in-base64-out \
+            --payload '{}' \
+            --output json \
+            build/migration-result.json > build/migration-metadata.json
+          jq -e 'has("FunctionError") | not' build/migration-metadata.json
+          jq -e '.status == "migrations applied"' build/migration-result.json
