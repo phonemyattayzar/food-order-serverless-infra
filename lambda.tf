@@ -68,8 +68,9 @@ resource "aws_lambda_function" "api" {
 
   environment {
     variables = {
-      DB_SECRET_ARN  = aws_secretsmanager_secret.db.arn
-      UPLOADS_BUCKET = aws_s3_bucket.site.bucket
+      DB_SECRET_ARN           = aws_secretsmanager_secret.db.arn
+      UPLOADS_BUCKET          = aws_s3_bucket.site.bucket
+      SUPPORT_TICKETS_ENABLED = tostring(var.support_tickets_enabled)
     }
   }
 

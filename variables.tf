@@ -99,3 +99,9 @@ variable "lambda_reserved_concurrency" {
   type        = number
   default     = -1
 }
+
+variable "support_tickets_enabled" {
+  description = "Enable the support ticket API feature in the application Lambda."
+  type        = bool
+  default     = false
+}

@@ -13,3 +13,4 @@ lambda_memory_mb          = 512
 lambda_timeout_seconds    = 15
 frontend_force_destroy    = true
 lambda_reserved_concurrency = -1
+support_tickets_enabled    = true

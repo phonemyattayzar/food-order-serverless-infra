@@ -13,3 +13,4 @@ lambda_timeout_seconds   = 20
 frontend_force_destroy   = false
 secret_recovery_window_days = 30
 lambda_reserved_concurrency = -1
+support_tickets_enabled    = false
